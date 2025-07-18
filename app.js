@@ -233,13 +233,13 @@ function trimBackslash(u) {
   }
 }
 
-fastify.get("/bgdex", async (request, reply) => {
+fastify.get("/bgdex", async function (request, reply) {
   const { id: username, p: password, srv, tu, tl, du, dl } = request.query;
 
   const client = new dexcom.DexcomClient({
     username,
     password,
-    server,
+    server: srv,
   });
 
   try {
@@ -257,43 +257,56 @@ fastify.get("/bgdex", async (request, reply) => {
       });
     }
 
-    const sgv = data[0]?.mgdl ?? null;
-    const dir = data[0]?.trend ?? null;
-    const sgvTs = data[0]?.timestamp
-      ? Math.floor(data[0].timestamp / 1000)
-      : null;
+    let sgv = null,
+      dir = null,
+      delta = null,
+      sgvTs = null,
+      iob = null,
+      iobTs = null,
+      cob = null,
+      cobTs = null,
+      upbat = 0,
+      hist = null,
+      avg = null,
+      tir = [0, 0, 0];
 
-    let delta = null;
-    if (data[1] && data[0].timestamp - data[1].timestamp <= 10 * 60 * 1000) {
-      delta = data[0].mgdl - data[1].mgdl;
+    if (data[0] != null) {
+      sgv = data[0].mgdl;
+      dir = data[0].trend;
+      sgvTs = Math.floor(data[0].timestamp / 1000);
+
+      if (
+        data[1] != null &&
+        data[0].timestamp - data[1].timestamp <= 10 * 60 * 1000
+      ) {
+        delta = data[0].mgdl - data[1].mgdl;
+      }
+
+      let h = [];
+      const endIdx = data.length > 24 ? 23 : data.length - 1;
+      for (let k = endIdx; k >= 0; k--) {
+        h.push([Math.floor(data[k].timestamp / 1000), data[k].mgdl]);
+      }
+      hist = h;
     }
-
-    const hist = data
-      .slice(0, Math.min(data.length, 24))
-      .map((entry) => [Math.floor(entry.timestamp / 1000), entry.mgdl]);
 
     let accum = 0;
     let cnt = 0;
-    const tir = [0, 0, 0];
-    const oneDayPrior = (epochTime() - 86400) * 1000;
+    const oneDayPrior = (epochTime() - 24 * 3600) * 1000;
+    for (let k = data.length - 1; k >= 0; k--) {
+      const value = data[k].mgdl;
+      const ts = data[k].timestamp;
+      if (ts >= oneDayPrior) {
+        accum += value;
+        cnt++;
 
-    for (let i = data.length - 1; i >= 0; i--) {
-      const entry = data[i];
-      if (entry.timestamp < oneDayPrior) continue;
-
-      accum += entry.mgdl;
-      cnt++;
-
-      if (entry.mgdl >= tl && entry.mgdl <= tu) {
-        tir[0] += 5;
-      } else if (entry.mgdl >= dl && entry.mgdl <= du) {
-        tir[1] += 5;
-      } else {
-        tir[2] += 5;
+        if (value <= tu && value >= tl) tir[0] += 5;
+        else if (value <= du && value >= dl) tir[1] += 5;
+        else tir[2] += 5;
       }
     }
 
-    const avg = cnt > 0 ? Math.round(accum / cnt) : null;
+    avg = cnt > 0 ? Math.round(accum / cnt) : null;
 
     return reply.code(200).send({
       success: true,
@@ -301,29 +314,29 @@ fastify.get("/bgdex", async (request, reply) => {
       sgv,
       dir,
       delta,
-      iobTs: null,
-      iob: null,
-      cobTs: null,
-      cob: null,
-      upbat: 0,
+      iobTs,
+      iob,
+      cobTs,
+      cob,
+      upbat,
       hist,
       tir,
       avg,
     });
-  } catch (err) {
-    const code = err?.statusCode || 500;
-    const message =
-      err?.error?.message || err?.message || "Dexcom request failed";
+  } catch (error) {
+    const code = error?.statusCode || 500;
+    const retryAfter = error?.response?.headers?.["retry-after"];
 
     return reply.code(code).send({
       success: false,
       code,
-      message,
+      message:
+        error?.error?.message || error?.message || "Dexcom request failed",
       step: "exception",
+      ...(retryAfter ? { retryAfter } : {}),
     });
   }
 });
-
 // simplified - for TGC cgm
 fastify.get("/bgdex1", function (request, reply) {
   // initialization
@@ -665,6 +678,7 @@ fastify.get("/bgllu", async (req, reply) => {
   const agent = "PostmanRuntime/7.43.0";
   const product = "llu.android";
   const version = "4.12.0";
+
   let server = getLluServer(srv);
   let token;
   let accountId;
@@ -686,6 +700,7 @@ fastify.get("/bgllu", async (req, reply) => {
 
     let loginResp = await request(loginOptions);
 
+    // handle region redirect
     if (loginResp?.data?.redirect) {
       const region = loginResp.data.region;
       server =
@@ -697,6 +712,7 @@ fastify.get("/bgllu", async (req, reply) => {
       loginResp = await request(loginOptions);
     }
 
+    // validate login
     if (!loginResp.data?.authTicket || !loginResp.data?.user) {
       return reply.code(401).send({
         success: false,
@@ -710,6 +726,7 @@ fastify.get("/bgllu", async (req, reply) => {
     const userId = loginResp.data.user.id;
     accountId = crypto.createHash("sha256").update(userId).digest("hex");
 
+    // fetch connection
     const connResp = await request({
       method: "GET",
       uri: `${server}/llu/connections`,
@@ -736,6 +753,7 @@ fastify.get("/bgllu", async (req, reply) => {
 
     const patientId = connResp.data[0].patientId;
 
+    // fetch graph
     const graphResp = await request({
       method: "GET",
       uri: `${server}/llu/connections/${patientId}/graph`,
@@ -784,7 +802,6 @@ fastify.get("/bgllu", async (req, reply) => {
     }
 
     const response = {
-      success: true,
       sgvTs,
       sgv: meas.ValueInMgPerDl,
       dir,
@@ -827,12 +844,6 @@ fastify.get("/bgllu2", async function (req, reply) {
   ];
   const srv = req.query.srv;
 
-  const results = await Promise.allSettled(
-    input.map(({ email, password }) =>
-      fetchLluUserData(email, password, srv, agent, product, version)
-    )
-  );
-
   const sgvTs = [null, null];
   const sgv = [null, null];
   const dir = [null, null];
@@ -849,6 +860,14 @@ fastify.get("/bgllu2", async function (req, reply) {
     [0, 0, 0],
   ];
 
+  let errorCode = 200;
+
+  const results = await Promise.allSettled(
+    input.map(({ email, password }) =>
+      fetchLluUserData(email, password, srv, agent, product, version)
+    )
+  );
+
   results.forEach((res, idx) => {
     if (res.status === "fulfilled") {
       const { glucoseMeasurement, graphData } = res.value.connectionData;
@@ -864,10 +883,12 @@ fastify.get("/bgllu2", async function (req, reply) {
           delta[idx] = entry.ValueInMgPerDl - graphData[j - 1].ValueInMgPerDl;
         }
       });
+    } else {
+      errorCode = res.reason?.statusCode || 500;
     }
   });
 
-  reply.code(200).send({
+  reply.code(errorCode === 200 ? 200 : errorCode).send({
     sgvTs,
     sgv,
     dir,
@@ -880,6 +901,7 @@ fastify.get("/bgllu2", async function (req, reply) {
     hist,
     tir,
     avg,
+    errorCode: errorCode === 200 ? undefined : errorCode,
   });
 });
 
@@ -908,6 +930,114 @@ function getLluServer(srv) {
     }
   }
   return server;
+}
+
+async function fetchLluUserData(email, password, server) {
+  const agent = "PostmanRuntime/7.43.0";
+  const product = "llu.android";
+  const version = "4.12.0";
+  let accountId, token;
+
+  let options = {
+    method: "POST",
+    uri: server + "/llu/auth/login",
+    headers: {
+      product,
+      version,
+      "Content-Type": "application/json",
+      accept: "*/*",
+      "User-Agent": agent,
+    },
+    body: { email, password },
+    json: true,
+  };
+
+  let parsedBody = await request2(options);
+
+  if (parsedBody.data.redirect) {
+    const region = parsedBody.data.region;
+    server =
+      region === "ru"
+        ? "https://api.libreview.ru"
+        : `https://api-${region}.libreview.io`;
+    options.uri = server + "/llu/auth/login";
+    parsedBody = await request2(options);
+  }
+
+  token = parsedBody.data.authTicket.token;
+  const userId = parsedBody.data.user.id;
+  accountId = crypto.createHash("sha256").update(userId).digest("hex");
+
+  const patientList = await request2({
+    method: "GET",
+    uri: server + "/llu/connections",
+    headers: {
+      product,
+      version,
+      "Account-Id": accountId,
+      Authorization: "Bearer " + token,
+      accept: "*/*",
+      "User-Agent": agent,
+      "cache-control": "no-cache",
+    },
+    json: true,
+  });
+
+  const patientId = patientList.data[0].patientId;
+
+  const graphData = await request2({
+    method: "GET",
+    uri: `${server}/llu/connections/${patientId}/graph`,
+    headers: {
+      product,
+      version,
+      "Account-Id": accountId,
+      Authorization: "Bearer " + token,
+      accept: "*/*",
+      "User-Agent": agent,
+      "cache-control": "no-cache",
+    },
+    json: true,
+  });
+
+  const meas = graphData.data.connection.glucoseMeasurement;
+  const nowTs = epochTimeD(new Date());
+  const sgvTs = epochTimeD(new Date(meas.FactoryTimestamp));
+  const sgv = meas.ValueInMgPerDl;
+  const dir = getTrendDesc(meas.TrendArrow);
+
+  const hist = [];
+  let delta = null;
+  if (graphData.data.graphData.length > 0) {
+    for (let j = 0; j < graphData.data.graphData.length; j++) {
+      const ts = epochTimeD(
+        new Date(graphData.data.graphData[j].FactoryTimestamp)
+      );
+      if (nowTs - ts < 7500) {
+        hist.push([ts, graphData.data.graphData[j].ValueInMgPerDl]);
+      }
+      if (ts === sgvTs && j > 0) {
+        delta =
+          graphData.data.graphData[j].ValueInMgPerDl -
+          graphData.data.graphData[j - 1].ValueInMgPerDl;
+      }
+    }
+  }
+
+  return {
+    sgvTs,
+    sgv,
+    dir,
+    delta,
+    iobTs: null,
+    iob: null,
+    cobTs: null,
+    cob: null,
+    upbat: 0,
+    hist,
+    avg: null,
+    tir: [0, 0, 0],
+  };
 }
 
 function getTrendDesc(trendArrow) {
