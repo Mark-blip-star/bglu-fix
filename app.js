@@ -7,7 +7,10 @@ const fastify = require("fastify")({
   // Set this to true for detailed logging:
   logger: false,
 });
-
+let lastLluRequestTs = 0;
+const MIN_DELAY = 5 * 60;
+const bgllu2RateLimit = new Map(); // key: ip, value: lastTs
+const BGLLU2_LIMIT_SEC = 300;
 const request = require("request");
 const request2 = require("request-promise");
 const dexcom = require("dexcom-share-api");
@@ -575,7 +578,10 @@ fastify.get("/bgdex2", async (request, reply) => {
     });
 
     if (!Array.isArray(data) || data.length === 0) {
-      throw new Error("No glucose data");
+      const err = new Error("No glucose data");
+      err.step = "glucose-fetch";
+      err.statusCode = 404;
+      throw err;
     }
 
     const sgv = data[0]?.mgdl ?? null;
@@ -611,7 +617,6 @@ fastify.get("/bgdex2", async (request, reply) => {
     const avg = cnt > 0 ? Math.round(accum / cnt) : null;
 
     return {
-      success: true,
       sgv,
       sgvTs,
       dir,
@@ -627,42 +632,36 @@ fastify.get("/bgdex2", async (request, reply) => {
     };
   };
 
-  const [res1, res2] = await Promise.allSettled([
-    getDexcomData(makeClient(id1, p1)),
-    getDexcomData(makeClient(id2, p2)),
-  ]);
+  try {
+    const results = await Promise.allSettled([
+      getDexcomData(makeClient(id1, p1)),
+      getDexcomData(makeClient(id2, p2)),
+    ]);
 
-  const result = {
-    data1: res1.status === "fulfilled" ? res1.value : null,
-    data2: res2.status === "fulfilled" ? res2.value : null,
-    success: res1.status === "fulfilled" || res2.status === "fulfilled",
-    code:
-      res1.status === "rejected" ? 500 : res2.status === "rejected" ? 500 : 200,
-  };
+    let error = null;
 
-  if (!result.success) {
-    result.message =
-      res1.reason?.message || res2.reason?.message || "Both requests failed";
+    const res1 = results[0];
+    const res2 = results[1];
+
+    if (res1.status === "rejected" && res2.status === "rejected") {
+      error = res1.reason || res2.reason;
+    }
+
+    return reply.code(error ? error.statusCode || 500 : 200).send({
+      code: error ? error.statusCode || 500 : 200,
+      message: error ? error.message || "Both requests failed" : "OK",
+      step: error ? error.step || "dexcom" : undefined,
+      data1: res1.status === "fulfilled" ? res1.value : null,
+      data2: res2.status === "fulfilled" ? res2.value : null,
+    });
+  } catch (e) {
+    return reply.code(500).send({
+      code: 500,
+      message: e.message || "Unexpected fatal error",
+      step: "fatal",
+    });
   }
-
-  return reply.code(result.code).send(result);
 });
-
-function handleLluError(reply, parsedBody, step) {
-  const httpCode = [401, 403, 429, 476].includes(parsedBody.status)
-    ? parsedBody.status
-    : 400;
-
-  reply.code(httpCode).send({
-    success: false,
-    error: parsedBody.error?.message || "Login failed or rate limited",
-    step,
-    raw: parsedBody,
-  });
-
-  throw new Error("Abort chain");
-}
-
 // ===== Libre link up================================================================
 /* Read from Libre LinkUp
   Added graph historical data
@@ -674,6 +673,19 @@ function handleLluError(reply, parsedBody, step) {
   Reference: https://gist.github.com/khskekec/6c13ba01b10d3018d816706a32ae8ab2
 */
 fastify.get("/bgllu", async (req, reply) => {
+  const now = Math.floor(Date.now() / 1000);
+  if (now - lastLluRequestTs < MIN_DELAY_SEC) {
+    return reply.code(429).send({
+      success: false,
+      code: 429,
+      message: `Rate limit exceeded. Try again after ${
+        MIN_DELAY_SEC - (now - lastLluRequestTs)
+      } seconds.`,
+      step: "rate-limit",
+    });
+  }
+  lastLluRequestTs = now;
+
   const { id: email, p: password, srv, noHist } = req.query;
   const agent = "PostmanRuntime/7.43.0";
   const product = "llu.android";
@@ -700,7 +712,6 @@ fastify.get("/bgllu", async (req, reply) => {
 
     let loginResp = await request(loginOptions);
 
-    // handle region redirect
     if (loginResp?.data?.redirect) {
       const region = loginResp.data.region;
       server =
@@ -712,7 +723,6 @@ fastify.get("/bgllu", async (req, reply) => {
       loginResp = await request(loginOptions);
     }
 
-    // validate login
     if (!loginResp.data?.authTicket || !loginResp.data?.user) {
       return reply.code(401).send({
         success: false,
@@ -726,7 +736,6 @@ fastify.get("/bgllu", async (req, reply) => {
     const userId = loginResp.data.user.id;
     accountId = crypto.createHash("sha256").update(userId).digest("hex");
 
-    // fetch connection
     const connResp = await request({
       method: "GET",
       uri: `${server}/llu/connections`,
@@ -753,7 +762,6 @@ fastify.get("/bgllu", async (req, reply) => {
 
     const patientId = connResp.data[0].patientId;
 
-    // fetch graph
     const graphResp = await request({
       method: "GET",
       uri: `${server}/llu/connections/${patientId}/graph`,
@@ -801,16 +809,14 @@ fastify.get("/bgllu", async (req, reply) => {
       }
     }
 
-    const response = {
+    return reply.code(200).send({
+      success: true,
       sgvTs,
       sgv: meas.ValueInMgPerDl,
       dir,
       delta,
-    };
-
-    if (!noHist) response.hist = hist;
-
-    return reply.code(200).send(response);
+      ...(noHist ? {} : { hist }),
+    });
   } catch (err) {
     const statusCode = err?.statusCode || 500;
     const retryAfter = err?.response?.headers?.["retry-after"];
@@ -824,7 +830,6 @@ fastify.get("/bgllu", async (req, reply) => {
     });
   }
 });
-
 /* Read from Libre LinkUp for 2 people
   Added graph historical data
   Version with redirect handling
@@ -834,6 +839,20 @@ fastify.get("/bgllu", async (req, reply) => {
   Reference: https://gist.github.com/khskekec/6c13ba01b10d3018d816706a32ae8ab2
 */
 fastify.get("/bgllu2", async function (req, reply) {
+  const ip = req.ip;
+  const now = Math.floor(Date.now() / 1000);
+  const lastTs = bgllu2RateLimit.get(ip) || 0;
+  if (now - lastTs < BGLLU2_LIMIT_SEC) {
+    return reply.code(429).send({
+      code: 429,
+      message: `Rate limit exceeded. Try again after ${
+        BGLLU2_LIMIT_SEC - (now - lastTs)
+      } seconds.`,
+      step: "rate-limit",
+    });
+  }
+  bgllu2RateLimit.set(ip, now);
+
   const agent = "PostmanRuntime/7.43.0";
   const product = "llu.android";
   const version = "4.12.0";
@@ -860,49 +879,77 @@ fastify.get("/bgllu2", async function (req, reply) {
     [0, 0, 0],
   ];
 
-  let errorCode = 200;
+  let firstError = null;
 
-  const results = await Promise.allSettled(
-    input.map(({ email, password }) =>
-      fetchLluUserData(email, password, srv, agent, product, version)
-    )
-  );
+  try {
+    const results = await Promise.allSettled(
+      input.map(({ email, password }) =>
+        fetchLluUserData(email, password, srv, agent, product, version)
+      )
+    );
 
-  results.forEach((res, idx) => {
-    if (res.status === "fulfilled") {
-      const { glucoseMeasurement, graphData } = res.value.connectionData;
-      dir[idx] = getTrendDesc(glucoseMeasurement.TrendArrow);
-      sgvTs[idx] = epochTimeD(new Date(glucoseMeasurement.FactoryTimestamp));
-      sgv[idx] = glucoseMeasurement.ValueInMgPerDl;
-      hist[idx] = [];
-      const nowTs = epochTimeD(new Date());
-      graphData.forEach((entry, j) => {
-        const ts = epochTimeD(new Date(entry.FactoryTimestamp));
-        if (nowTs - ts < 7500) hist[idx].push([ts, entry.ValueInMgPerDl]);
-        if (ts === sgvTs[idx] && j > 0) {
-          delta[idx] = entry.ValueInMgPerDl - graphData[j - 1].ValueInMgPerDl;
+    results.forEach((res, idx) => {
+      if (
+        res.status === "fulfilled" &&
+        res.value?.connectionData?.glucoseMeasurement
+      ) {
+        const { glucoseMeasurement, graphData } = res.value.connectionData;
+        dir[idx] = getTrendDesc(glucoseMeasurement.TrendArrow);
+        sgvTs[idx] = epochTimeD(new Date(glucoseMeasurement.FactoryTimestamp));
+        sgv[idx] = glucoseMeasurement.ValueInMgPerDl;
+        hist[idx] = [];
+
+        const nowTs = epochTimeD(new Date());
+        graphData?.forEach((entry, j) => {
+          const ts = epochTimeD(new Date(entry.FactoryTimestamp));
+          if (nowTs - ts < 7500) hist[idx].push([ts, entry.ValueInMgPerDl]);
+          if (ts === sgvTs[idx] && j > 0) {
+            delta[idx] = entry.ValueInMgPerDl - graphData[j - 1].ValueInMgPerDl;
+          }
+        });
+      } else {
+        if (!firstError) {
+          const e = res.reason;
+          firstError = {
+            code: e?.statusCode || 500,
+            message: e?.message || "Unexpected error",
+            step: e?.step || "exception",
+          };
         }
-      });
-    } else {
-      errorCode = res.reason?.statusCode || 500;
-    }
-  });
+      }
+    });
 
-  reply.code(errorCode === 200 ? 200 : errorCode).send({
-    sgvTs,
-    sgv,
-    dir,
-    delta,
-    iobTs,
-    iob,
-    cobTs,
-    cob,
-    upbat,
-    hist,
-    tir,
-    avg,
-    errorCode: errorCode === 200 ? undefined : errorCode,
-  });
+    if (firstError) {
+      return reply.code(firstError.code).send({
+        code: firstError.code,
+        message: firstError.message,
+        step: firstError.step,
+      });
+    }
+
+    return reply.code(200).send({
+      code: 200,
+      sgvTs,
+      sgv,
+      dir,
+      delta,
+      iobTs,
+      iob,
+      cobTs,
+      cob,
+      upbat,
+      hist,
+      tir,
+      avg,
+    });
+  } catch (err) {
+    const code = err?.statusCode || 500;
+    return reply.code(code).send({
+      code,
+      message: err.message || "Fatal exception",
+      step: "fatal",
+    });
+  }
 });
 
 function getLluServer(srv) {
