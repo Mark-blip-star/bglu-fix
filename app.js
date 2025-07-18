@@ -233,104 +233,95 @@ function trimBackslash(u) {
   }
 }
 
-// read from Dexcom Share
-fastify.get("/bgdex", function (request, reply) {
-  // initialization
-  const client = new dexcom.DexcomClient({
-    username: request.query.id,
-    password: request.query.p,
-    // This server needs to be either "us" or "eu. If you're in the US, the server
-    // should be "us". Any other country outside of the US (eg. Canada) is
-    // classified as "eu" by Dexcom
-    server: request.query.srv,
-  });
-  //client.getAccountId().then(console.log)
-  //client.getSessionId().then(console.log)
-  var sgv = null;
-  var dir = null;
-  var delta = null;
-  var sgvTs = null;
-  var iob = null;
-  var iobTs = null;
-  var cob = null;
-  var cobTs = null;
-  var upbat = 0;
-  var hist = null;
-  var avg = null;
-  var tir = [0, 0, 0];
-  client
-    .getEstimatedGlucoseValues({ maxCount: 288, minutes: 1440 })
-    .then((data) => {
-      //console.log(data.length);
-      //console.log(data);
-      if (data[0] != null) {
-        sgv = data[0].mgdl;
-        dir = data[0].trend;
-        sgvTs = Math.floor(data[0].timestamp / 1000);
-        if (data[1] != null) {
-          const prevSgv = data[0].mgdl;
-          // if time diff is reasonable 10 minutes or less
-          if (data[0].timestamp - data[1].timestamp <= 10 * 60 * 1000) {
-            delta = data[0].mgdl - data[1].mgdl;
-          }
-        }
-        var h = []; // 2 hour history
-        let endIdx = data.length > 24 ? 23 : data.length - 1;
-        for (var k = endIdx; k >= 0; k--) {
-          let elem = [Math.floor(data[k].timestamp / 1000), data[k].mgdl];
-          h.push(elem);
-        }
-        hist = h;
-      }
-      // calc time in ranges (3 ranges)
-      var accum = 0;
-      var cnt = 0;
-      const oneDayPrior = (epochTime() - 24 * 3600) * 1000;
-      for (var k = data.length - 1; k >= 0; k--) {
-        if (data[k].timestamp >= oneDayPrior) {
-          accum += data[k].mgdl;
-          cnt++;
-          if (
-            data[k].mgdl <= request.query.tu &&
-            data[k].mgdl >= request.query.tl
-          ) {
-            tir[0] += 5;
-          } else if (
-            data[k].mgdl <= request.query.du &&
-            data[k].mgdl >= request.query.dl
-          ) {
-            tir[1] += 5;
-          } else {
-            tir[2] += 5;
-          }
-        }
-      }
-      avg = Math.round(accum / cnt);
+fastify.get("/bgdex", async (request, reply) => {
+  const { id: username, p: password, srv, tu, tl, du, dl } = request.query;
 
-      const jsonObj = {
-        sgvTs: sgvTs,
-        sgv: sgv,
-        dir: dir,
-        delta: delta,
-        iobTs: iobTs,
-        iob: iob,
-        cobTs: cobTs,
-        cob: cob,
-        upbat: upbat,
-        hist: hist,
-        tir: tir,
-        avg: avg,
-      };
-      reply.status(200).send(jsonObj);
-    })
-    .catch((error) => {
-      console.log("error!");
-      console.log(error);
-      // An error occurred while performing the tasks, handle it here
-      reply
-        .status(error.statusCode)
-        .send({ code: error.statusCode, error: error.error }); // temporary
+  const client = new dexcom.DexcomClient({
+    username,
+    password,
+    server,
+  });
+
+  try {
+    const data = await client.getEstimatedGlucoseValues({
+      maxCount: 288,
+      minutes: 1440,
     });
+
+    if (!data || data.length === 0) {
+      return reply.code(404).send({
+        success: false,
+        code: 404,
+        message: "No glucose data available",
+        step: "fetch",
+      });
+    }
+
+    const sgv = data[0]?.mgdl ?? null;
+    const dir = data[0]?.trend ?? null;
+    const sgvTs = data[0]?.timestamp
+      ? Math.floor(data[0].timestamp / 1000)
+      : null;
+
+    let delta = null;
+    if (data[1] && data[0].timestamp - data[1].timestamp <= 10 * 60 * 1000) {
+      delta = data[0].mgdl - data[1].mgdl;
+    }
+
+    const hist = data
+      .slice(0, Math.min(data.length, 24))
+      .map((entry) => [Math.floor(entry.timestamp / 1000), entry.mgdl]);
+
+    let accum = 0;
+    let cnt = 0;
+    const tir = [0, 0, 0];
+    const oneDayPrior = (epochTime() - 86400) * 1000;
+
+    for (let i = data.length - 1; i >= 0; i--) {
+      const entry = data[i];
+      if (entry.timestamp < oneDayPrior) continue;
+
+      accum += entry.mgdl;
+      cnt++;
+
+      if (entry.mgdl >= tl && entry.mgdl <= tu) {
+        tir[0] += 5;
+      } else if (entry.mgdl >= dl && entry.mgdl <= du) {
+        tir[1] += 5;
+      } else {
+        tir[2] += 5;
+      }
+    }
+
+    const avg = cnt > 0 ? Math.round(accum / cnt) : null;
+
+    return reply.code(200).send({
+      success: true,
+      sgvTs,
+      sgv,
+      dir,
+      delta,
+      iobTs: null,
+      iob: null,
+      cobTs: null,
+      cob: null,
+      upbat: 0,
+      hist,
+      tir,
+      avg,
+    });
+  } catch (err) {
+    const code = err?.statusCode || 500;
+    const message =
+      err?.error?.message || err?.message || "Dexcom request failed";
+
+    return reply.code(code).send({
+      success: false,
+      code,
+      message,
+      step: "exception",
+    });
+  }
 });
 
 // simplified - for TGC cgm
@@ -558,120 +549,90 @@ fastify.get("/bgdual", (request, reply) => {
 
 // 2 person Dexcom version
 // query params id1, id2, p1, p2, srv, tu, tl, du, dl
-fastify.get("/bgdex2", (request, reply) => {
-  var sgv = [null, null];
-  var dir = [null, null];
-  var delta = [null, null];
-  var sgvTs = [null, null];
-  var iob = [null, null];
-  var iobTs = [null, null];
-  var cob = [null, null];
-  var cobTs = [null, null];
-  var upbat = [0, 0];
-  var hist = [null, null];
-  var avg = [null, null];
-  var tir = [
-    [0, 0, 0],
-    [0, 0, 0],
-  ];
+fastify.get("/bgdex2", async (request, reply) => {
+  const { id1, p1, id2, p2, srv, tu, tl, du, dl } = request.query;
 
-  const client1 = new dexcom.DexcomClient({
-    username: request.query.id1,
-    password: request.query.p1,
-    // This server needs to be either "us" or "eu. If you're in the US, the server
-    // should be "us". Any other country outside of the US (eg. Canada) is
-    // classified as "eu" by Dexcom
-    server: request.query.srv,
-  });
-  const client2 = new dexcom.DexcomClient({
-    username: request.query.id2,
-    password: request.query.p2,
-    server: request.query.srv,
-  });
+  const makeClient = (username, password) =>
+    new dexcom.DexcomClient({ username, password, server: srv });
 
-  var promises = [];
-  promises.push(
-    client1.getEstimatedGlucoseValues({ maxCount: 288, minutes: 1440 })
-  );
-  promises.push(
-    client2.getEstimatedGlucoseValues({ maxCount: 288, minutes: 1440 })
-  );
-  Promise.all(promises)
-    .then((data) => {
-      // data = [promise1,promise2]
-      for (var i = 0; i < 2; i++) {
-        // for each person
-        if (data[i] != null) {
-          sgv[i] = data[i][0].mgdl;
-          dir[i] = data[i][0].trend;
-          sgvTs[i] = Math.floor(data[i][0].timestamp / 1000);
-          if (data[i][1] != null) {
-            const prevSgv = data[i][0].mgdl;
-            // if time diff is reasonable 10 minutes or less
-            if (data[i][0].timestamp - data[i][1].timestamp <= 10 * 60 * 1000) {
-              delta[i] = data[i][0].mgdl - data[i][1].mgdl;
-            }
-          }
-          var h = []; // 2 hour history
-          let endIdx = data[i].length > 24 ? 23 : data[i].length - 1;
-          for (var k = endIdx; k >= 0; k--) {
-            let elem = [
-              Math.floor(data[i][k].timestamp / 1000),
-              data[i][k].mgdl,
-            ];
-            h.push(elem);
-          }
-          hist[i] = h;
-        }
-        // calc time in ranges (3 ranges)
-        var accum = 0;
-        var cnt = 0;
-        const oneDayPrior = (epochTime() - 24 * 3600) * 1000;
-        for (var k = data[i].length - 1; k >= 0; k--) {
-          if (data[i][k].timestamp >= oneDayPrior) {
-            accum += data[i][k].mgdl;
-            cnt++;
-            if (
-              data[i][k].mgdl <= request.query.tu &&
-              data[i][k].mgdl >= request.query.tl
-            ) {
-              tir[i][0] += 5;
-            } else if (
-              data[i][k].mgdl <= request.query.du &&
-              data[i][k].mgdl >= request.query.dl
-            ) {
-              tir[i][1] += 5;
-            } else {
-              tir[i][2] += 5;
-            }
-          }
-        }
-        avg[i] = Math.round(accum / cnt);
-      }
-      const jsonObj = {
-        sgvTs: sgvTs,
-        sgv: sgv,
-        dir: dir,
-        delta: delta,
-        iobTs: iobTs,
-        iob: iob,
-        cobTs: cobTs,
-        cob: cob,
-        upbat: upbat,
-        hist: hist,
-        tir: tir,
-        avg: avg,
-      };
-      reply.status(200).send(jsonObj);
-    })
-    .catch((error) => {
-      console.log("error!");
-      console.log(error);
-      // An error occurred while performing the tasks, handle it here
-      reply
-        .status(error.statusCode)
-        .send({ code: error.statusCode, error: error.error }); // temporary
+  const getDexcomData = async (client) => {
+    const data = await client.getEstimatedGlucoseValues({
+      maxCount: 288,
+      minutes: 1440,
     });
+
+    if (!Array.isArray(data) || data.length === 0) {
+      throw new Error("No glucose data");
+    }
+
+    const sgv = data[0]?.mgdl ?? null;
+    const dir = data[0]?.trend ?? null;
+    const sgvTs = data[0]?.timestamp
+      ? Math.floor(data[0].timestamp / 1000)
+      : null;
+
+    let delta = null;
+    if (data[1] && data[0].timestamp - data[1].timestamp <= 10 * 60 * 1000) {
+      delta = data[0].mgdl - data[1].mgdl;
+    }
+
+    const hist = data
+      .slice(0, Math.min(24, data.length))
+      .map((d) => [Math.floor(d.timestamp / 1000), d.mgdl]);
+
+    let accum = 0;
+    let cnt = 0;
+    const tir = [0, 0, 0];
+    const oneDayPrior = (epochTime() - 86400) * 1000;
+
+    for (const entry of data) {
+      if (entry.timestamp < oneDayPrior) continue;
+      accum += entry.mgdl;
+      cnt++;
+
+      if (entry.mgdl >= tl && entry.mgdl <= tu) tir[0] += 5;
+      else if (entry.mgdl >= dl && entry.mgdl <= du) tir[1] += 5;
+      else tir[2] += 5;
+    }
+
+    const avg = cnt > 0 ? Math.round(accum / cnt) : null;
+
+    return {
+      success: true,
+      sgv,
+      sgvTs,
+      dir,
+      delta,
+      iob: null,
+      iobTs: null,
+      cob: null,
+      cobTs: null,
+      upbat: 0,
+      hist,
+      tir,
+      avg,
+    };
+  };
+
+  const [res1, res2] = await Promise.allSettled([
+    getDexcomData(makeClient(id1, p1)),
+    getDexcomData(makeClient(id2, p2)),
+  ]);
+
+  const result = {
+    data1: res1.status === "fulfilled" ? res1.value : null,
+    data2: res2.status === "fulfilled" ? res2.value : null,
+    success: res1.status === "fulfilled" || res2.status === "fulfilled",
+    code:
+      res1.status === "rejected" ? 500 : res2.status === "rejected" ? 500 : 200,
+  };
+
+  if (!result.success) {
+    result.message =
+      res1.reason?.message || res2.reason?.message || "Both requests failed";
+  }
+
+  return reply.code(result.code).send(result);
 });
 
 function handleLluError(reply, parsedBody, step) {
@@ -855,293 +816,71 @@ fastify.get("/bgllu", async (req, reply) => {
                       srv: server
   Reference: https://gist.github.com/khskekec/6c13ba01b10d3018d816706a32ae8ab2
 */
-fastify.get("/bgllu2", function (req, reply) {
-  var sgvTs = [null, null];
-  var sgv = [null, null];
-  var dir = [null, null];
-  var delta = [null, null];
-  var iob = [null, null];
-  var iobTs = [null, null];
-  var cob = [null, null];
-  var cobTs = [null, null];
-  var upbat = [0, 0];
-  var hist = [null, null];
-  var avg = [null, null];
-  var tir = [
+fastify.get("/bgllu2", async function (req, reply) {
+  const agent = "PostmanRuntime/7.43.0";
+  const product = "llu.android";
+  const version = "4.12.0";
+
+  const input = [
+    { email: req.query.id1, password: req.query.p1 },
+    { email: req.query.id2, password: req.query.p2 },
+  ];
+  const srv = req.query.srv;
+
+  const results = await Promise.allSettled(
+    input.map(({ email, password }) =>
+      fetchLluUserData(email, password, srv, agent, product, version)
+    )
+  );
+
+  const sgvTs = [null, null];
+  const sgv = [null, null];
+  const dir = [null, null];
+  const delta = [null, null];
+  const iob = [null, null];
+  const iobTs = [null, null];
+  const cob = [null, null];
+  const cobTs = [null, null];
+  const upbat = [0, 0];
+  const hist = [null, null];
+  const avg = [null, null];
+  const tir = [
     [0, 0, 0],
     [0, 0, 0],
   ];
 
-  const agent = "PostmanRuntime/7.43.0";
-  const product = "llu.android";
-  const version = "4.12.0";
-  // select server
-  var server = getLluServer(req.query.srv);
-  var resp = { success: false };
-  var accountId;
-  var token;
-  var options = {
-    method: "POST",
-    uri: server + "/llu/auth/login",
-    headers: {
-      product: product,
-      version: version,
-      "Content-Type": "application/json",
-      accept: "*/*",
-      "User-Agent": agent,
-    },
-    body: {
-      email: req.query.id1,
-      password: req.query.p1,
-    },
-    json: true, // Automatically stringifies the body to JSON
-  };
-  resp = { success: false, step: 0 };
-  request2(options)
-    .then(function (parsedBody) {
-      resp = { success: false, step: 1 };
-      // determine if we have the right server
-      /*
-          if credentials are correct but server is wrong, 
-          response will be like:
-          {"status":0,"data":{"redirect":true,"region":"eu"}}
-        */
-      if (parsedBody.data.redirect != null) {
-        // get region and build correct server uri
-        let region = parsedBody.data.region;
-        if (region == "ru") {
-          server = "https://api.libreview.ru";
-        } else {
-          server = "https://api-" + region + ".libreview.io";
+  results.forEach((res, idx) => {
+    if (res.status === "fulfilled") {
+      const { glucoseMeasurement, graphData } = res.value.connectionData;
+      dir[idx] = getTrendDesc(glucoseMeasurement.TrendArrow);
+      sgvTs[idx] = epochTimeD(new Date(glucoseMeasurement.FactoryTimestamp));
+      sgv[idx] = glucoseMeasurement.ValueInMgPerDl;
+      hist[idx] = [];
+      const nowTs = epochTimeD(new Date());
+      graphData.forEach((entry, j) => {
+        const ts = epochTimeD(new Date(entry.FactoryTimestamp));
+        if (nowTs - ts < 7500) hist[idx].push([ts, entry.ValueInMgPerDl]);
+        if (ts === sgvTs[idx] && j > 0) {
+          delta[idx] = entry.ValueInMgPerDl - graphData[j - 1].ValueInMgPerDl;
         }
-        options.uri = server + "/llu/auth/login";
-        // repeat request on correct server
-        return request2(options);
-      } else {
-        // continue to next step
-        return parsedBody;
-      }
-    })
-    .then(function (parsedBody) {
-      resp = { success: false, step: 2 };
-      let userId = parsedBody.data.user.id;
-      token = parsedBody.data.authTicket.token;
-      accountId = crypto
-        .createHash("sha256")
-        .update(parsedBody.data.user.id)
-        .digest("hex");
-      let options2 = {
-        method: "GET",
-        uri: server + "/llu/connections",
-        headers: {
-          product: product,
-          version: version,
-          "Account-Id": accountId,
-          Authorization: "Bearer " + token,
-          accept: "*/*",
-          "User-Agent": agent,
-          "cache-control": "no-cache",
-        },
-        json: true, // Automatically stringifies the body to JSON
-      };
-      return request2(options2);
-    })
-    .then(function (parsedBody) {
-      resp = { success: false, step: 3 };
-      const patientId = parsedBody.data[0].patientId;
-      let options3 = {
-        method: "GET",
-        uri: server + "/llu/connections/" + patientId + "/graph",
-        headers: {
-          product: product,
-          version: version,
-          "Account-Id": accountId,
-          Authorization: "Bearer " + token,
-          accept: "*/*",
-          "User-Agent": agent,
-          "cache-control": "no-cache",
-        },
-        json: true, // Automatically stringifies the body to JSON
-      };
-      return request2(options3);
-    })
-    .then(function (parsedBody) {
-      resp = { success: false, step: 4 };
-      let meas = parsedBody.data.connection.glucoseMeasurement;
-      // convert trendArrow into standard strings
-      dir[0] = getTrendDesc(meas.TrendArrow);
-      // convert FactoryTimestamp (UTC) to an epoch time value
-      sgvTs[0] = epochTimeD(new Date(meas.FactoryTimestamp));
-      sgv[0] = meas.ValueInMgPerDl;
-      hist[0] = [];
-      var nowTs = epochTimeD(new Date());
-      if (parsedBody.data.graphData.length > 0) {
-        // order of data appears to be oldest first
-        for (var j = 0; j < parsedBody.data.graphData.length; j++) {
-          // limit to data 2 hours old
-          var ts = epochTimeD(
-            new Date(parsedBody.data.graphData[j].FactoryTimestamp)
-          );
-          if (nowTs - ts < 7500) {
-            // 2h+5min margin
-            let elem = [ts, parsedBody.data.graphData[j].ValueInMgPerDl];
-            hist[0].push(elem);
-          }
-          if (ts == sgvTs[0] && j > 0) {
-            // if latest value
-            // calculate delta from previous value
-            delta[0] =
-              parsedBody.data.graphData[j].ValueInMgPerDl -
-              parsedBody.data.graphData[j - 1].ValueInMgPerDl;
-          }
-        }
-      }
-      // START REQUEST FOR PERSON 2 =====================================================
-      server == getLluServer(req.query.srv);
-      options = {
-        method: "POST",
-        uri: server + "/llu/auth/login",
-        headers: {
-          product: product,
-          version: version,
-          "Content-Type": "application/json",
-          accept: "*/*",
-          "User-Agent": agent,
-        },
-        body: {
-          email: req.query.id2,
-          password: req.query.p2,
-        },
-        json: true, // Automatically stringifies the body to JSON
-      };
-      return request2(options);
-    })
-    .then(function (parsedBody) {
-      resp = { success: false, step: 5 };
-      // determine if we have the right server
-      /*
-          if credentials are correct but server is wrong, 
-          response will be like:
-          {"status":0,"data":{"redirect":true,"region":"eu"}}
-        */
-      if (parsedBody.data.redirect != null) {
-        // get region and build correct server uri
-        let region = parsedBody.data.region;
-        if (region == "ru") {
-          server = "https://api.libreview.ru";
-        } else {
-          server = "https://api-" + region + ".libreview.io";
-        }
-        options.uri = server + "/llu/auth/login";
-        // repeat request on correct server
-        return request2(options);
-      } else {
-        // continue to next step
-        return parsedBody;
-      }
-    })
-    .then(function (parsedBody) {
-      resp = { success: false, step: 6 };
-      let userId = parsedBody.data.user.id;
-      token = parsedBody.data.authTicket.token;
-      accountId = crypto
-        .createHash("sha256")
-        .update(parsedBody.data.user.id)
-        .digest("hex");
-      let options2 = {
-        method: "GET",
-        uri: server + "/llu/connections",
-        headers: {
-          product: product,
-          version: version,
-          "Account-Id": accountId,
-          Authorization: "Bearer " + token,
-          accept: "*/*",
-          "User-Agent": agent,
-          "cache-control": "no-cache",
-        },
-        json: true, // Automatically stringifies the body to JSON
-      };
-      return request2(options2);
-    })
-    .then(function (parsedBody) {
-      resp = { success: false, step: 7 };
-      const patientId = parsedBody.data[0].patientId;
-      let options3 = {
-        method: "GET",
-        uri: server + "/llu/connections/" + patientId + "/graph",
-        headers: {
-          product: product,
-          version: version,
-          "Account-Id": accountId,
-          Authorization: "Bearer " + token,
-          accept: "*/*",
-          "User-Agent": agent,
-          "cache-control": "no-cache",
-        },
-        json: true, // Automatically stringifies the body to JSON
-      };
-      return request2(options3);
-    })
-    .then(function (parsedBody) {
-      resp = { success: false, step: 8 };
-      let meas = parsedBody.data.connection.glucoseMeasurement;
-      // convert trendArrow into standard strings
-      dir[1] = getTrendDesc(meas.TrendArrow);
-      // convert FactoryTimestamp (UTC) to an epoch time value
-      sgvTs[1] = epochTimeD(new Date(meas.FactoryTimestamp));
-      sgv[1] = meas.ValueInMgPerDl;
-      hist[1] = [];
-      var nowTs = epochTimeD(new Date());
-      if (parsedBody.data.graphData.length > 0) {
-        // order of data appears to be oldest first
-        for (var j = 0; j < parsedBody.data.graphData.length; j++) {
-          // limit to data 2 hours old
-          var ts = epochTimeD(
-            new Date(parsedBody.data.graphData[j].FactoryTimestamp)
-          );
-          if (nowTs - ts < 7500) {
-            // 2h+5min margin
-            let elem = [ts, parsedBody.data.graphData[j].ValueInMgPerDl];
-            hist[1].push(elem);
-          }
-          if (ts == sgvTs[1] && j > 0) {
-            // if latest value
-            // calculate delta from previous value
-            delta[1] =
-              parsedBody.data.graphData[j].ValueInMgPerDl -
-              parsedBody.data.graphData[j - 1].ValueInMgPerDl;
-          }
-        }
-      }
-      resp = {
-        sgvTs: sgvTs,
-        //ts: meas.FactoryTimestamp,
-        sgv: sgv,
-        dir: dir,
-        delta: delta,
-        iobTs: iobTs,
-        iob: iob,
-        cobTs: cobTs,
-        cob: cob,
-        upbat: upbat,
-        hist: hist,
-        tir: tir,
-        avg: avg,
-      };
-    })
-    .finally(function () {
-      reply.code(200).send(resp);
-    })
-    .catch(function (err) {
-      // POST failed...
-      // NOTE: if error 430, then too many requests are being made within a short time period.
-      // this is a server attack protection
-      console.log("ERROR!");
-      //console.log(err.statusCode);
-      console.log(err);
-      reply.code(err.statusCode).send({ result: 0 });
-    });
+      });
+    }
+  });
+
+  reply.code(200).send({
+    sgvTs,
+    sgv,
+    dir,
+    delta,
+    iobTs,
+    iob,
+    cobTs,
+    cob,
+    upbat,
+    hist,
+    tir,
+    avg,
+  });
 });
 
 function getLluServer(srv) {
