@@ -1,0 +1,23 @@
+{
+  "name": "Dacrosse_Scripts_1_Proto",
+  "version": "1.0.0",
+  "description": "Dacrosse scripts 1",
+  "main": "app.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "fastify": "^4.28.1",
+    "request": "^2.88.2",
+    "request-promise": "^4.2.6",
+    "dexcom-share-api": "^1.0.8"
+  },
+  "engines": {
+    "node": "14.x"
+  },
+  "repository": {
+    "url": "https://glitch.com/edit/#!/glitch-hello-node"
+  },
+  "author": "",
+  "license": "ISC"
+}
