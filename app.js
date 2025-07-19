@@ -6,10 +6,6 @@ const fastify = require("fastify")({
   // Set this to true for detailed logging:
   logger: false,
 });
-let lastLluRequestTs = 0;
-const MIN_DELAY_SEC = 5 * 60;
-const bgllu2RateLimit = new Map(); // key: ip, value: lastTs
-const BGLLU2_LIMIT_SEC = 300;
 const request = require("request");
 const request2 = require("request-promise");
 const dexcom = require("dexcom-share-api");
@@ -642,16 +638,6 @@ fastify.get("/bgdex2", async (request, reply) => {
 
 fastify.get("/bgllu", async (req, reply) => {
   const now = Math.floor(Date.now() / 1000);
-  if (now - lastLluRequestTs < MIN_DELAY_SEC) {
-    return reply.code(429).send({
-      success: false,
-      code: 429,
-      message: `Rate limit exceeded. Try again after ${
-        MIN_DELAY_SEC - (now - lastLluRequestTs)
-      } seconds.`,
-      step: "rate-limit",
-    });
-  }
   lastLluRequestTs = now;
   const { id: email, p: password, srv, noHist } = req.query;
   const agent = "PostmanRuntime/7.43.0";
@@ -836,19 +822,6 @@ function getTrendDesc(trendArrow) {
 }
 
 fastify.get("/bgllu2", async (req, reply) => {
-  const ip = req.ip;
-  const now = Math.floor(Date.now() / 1000);
-  const lastTs = bgllu2RateLimit.get(ip) || 0;
-  if (now - lastTs < BGLLU2_LIMIT_SEC) {
-    return reply.code(429).send({
-      code: 429,
-      message: `Rate limit exceeded. Try again after ${
-        BGLLU2_LIMIT_SEC - (now - lastTs)
-      } seconds.`,
-      step: "rate-limit",
-    });
-  }
-  bgllu2RateLimit.set(ip, now);
   const agent = "PostmanRuntime/7.43.0";
   const product = "llu.android";
   const version = "4.12.0";
